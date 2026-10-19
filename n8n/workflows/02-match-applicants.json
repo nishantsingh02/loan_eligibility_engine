@@ -1,0 +1,152 @@
+{
+  "name": "02 · Match applicant batches",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "match-run",
+        "authentication": "headerAuth",
+        "responseMode": "lastNode",
+        "options": {
+          "allowedOrigins": ""
+        }
+      },
+      "id": "86ca632c-b61a-480c-91ea-c19ee781f8be",
+      "name": "Receive queued run",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "7c23294a-3764-498e-a95a-e9899d778f68",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickpe-internal",
+          "name": "ClickPe internal API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nWITH started AS (\n  UPDATE run SET status='processing',started_at=COALESCE(started_at,now())\n  WHERE run_id=$1 AND status='queued' RETURNING run_id\n), policies AS MATERIALIZED (\n  SELECT rp.product_id,s.snapshot_id::text,s.rules FROM run_policy rp\n  JOIN policy_snapshot s ON s.snapshot_id=rp.snapshot_id WHERE rp.run_id=$1\n), bounds AS (\n  SELECT LEAST(200,GREATEST(1,400/GREATEST(COUNT(*),1)))::int AS page_size,\n         COUNT(*) AS product_count FROM policies\n), page AS MATERIALIZED (\n  SELECT user_id,monthly_income,credit_score,employment_status,age\n  FROM batch_user WHERE run_id=$1 AND user_id>$2\n  ORDER BY user_id LIMIT (SELECT page_size+1 FROM bounds)\n), numbered AS (\n  SELECT *,ROW_NUMBER() OVER (ORDER BY user_id) AS seq FROM page\n), selected AS MATERIALIZED (\n  SELECT * FROM numbered WHERE seq<=(SELECT page_size FROM bounds)\n), pairs AS MATERIALIZED (\n  SELECT u.user_id,p.product_id,p.snapshot_id,p.rules,\n         policy_hard_screen(to_jsonb(u)-'seq',p.rules) AS screen\n  FROM selected u CROSS JOIN policies p\n)\nSELECT $1::text AS run_id,$2::text AS cursor_user_id,\n  (SELECT product_count FROM bounds) AS product_count,\n  COALESCE((SELECT jsonb_agg(to_jsonb(u)-'seq' || jsonb_build_object('products',\n    (SELECT COALESCE(jsonb_agg(jsonb_build_object('product_id',p.product_id,\n      'snapshot_id',p.snapshot_id,'rules',p.rules,'mandatory_findings',p.screen->'findings') ORDER BY p.product_id),'[]'::jsonb)\n     FROM pairs p WHERE p.user_id=u.user_id AND NOT (p.screen->>'hard_failure')::boolean))\n    ORDER BY u.user_id) FROM selected u),'[]'::jsonb) AS users,\n  COALESCE((SELECT jsonb_agg(jsonb_build_object('user_id',user_id,'product_id',product_id,\n    'snapshot_id',snapshot_id,'decision','ineligible','reasons',screen->'findings',\n    'rule_version','rules-v2-staged') ORDER BY user_id,product_id)\n    FROM pairs WHERE (screen->>'hard_failure')::boolean),'[]'::jsonb) AS preclassified_results,\n  (SELECT COUNT(*) FROM pairs WHERE (screen->>'hard_failure')::boolean) AS prefiltered_count,\n  (SELECT COUNT(*) FROM pairs WHERE NOT (screen->>'hard_failure')::boolean) AS candidate_count,\n  (SELECT COUNT(*) FROM numbered)>(SELECT page_size FROM bounds) AS has_more,\n  COALESCE((SELECT MAX(user_id) FROM selected),$2::text) AS last_user_id\n",
+        "options": {
+          "queryReplacement": "={{ [$json.body.run_id, $json.body.cursor_user_id || ''] }}"
+        }
+      },
+      "id": "e0503611-ed46-4427-a385-96190bf7424c",
+      "name": "Fetch up to 200 profiles · Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        480,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "clickpe-postgres",
+          "name": "ClickPe database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const row=$input.first().json;\nconst parse=x=>typeof x==='string'?JSON.parse(x):x;\nconst users=parse(row.users)||[];\nif(Number(row.product_count)<1||Number(row.product_count)>400)throw new Error('Run needs 1 to 400 pinned products');\nconst results=[...(parse(row.preclassified_results)||[])];\nfor(const user of users){\n  for(const product of (user.products||[])){\n    const rules=parse(product.rules);\n    const mandatory=parse(product.mandatory_findings)||[];\n    const reasons=[];\n    let unresolved=false;\n    const required=criterion=>{\n      const finding=mandatory.find(f=>f.criterion===criterion);\n      if(!finding||finding.status!=='pass')throw new Error('Invalid SQL candidate findings');\n      reasons.push(finding);\n    };\n    if(rules.employment.kind==='required')required('employment_status');\n    else{unresolved=true;reasons.push({criterion:'employment_status',status:'unknown',message:'This product employment rule needs confirmation.'});}\n    if(rules.age.kind==='required')required('age');\n    else{unresolved=true;reasons.push({criterion:'age',status:'unknown',message:'The official source does not establish the age criteria.'});}\n    if(rules.monthly_income.kind==='required'&&!rules.monthly_income.location_dependent)required('monthly_income');\n    else{unresolved=true;reasons.push({criterion:'monthly_income',status:'unknown',message:'Location-specific income terms cannot be checked from this file.'});}\n    const score=rules.credit_score;\n    if(score.kind==='required')required('credit_score');\n    else if(score.kind==='preferred'){\n      const pass=Number(user.credit_score)>=score.min;\n      reasons.push({criterion:'credit_score',status:pass?'pass':'review',preferred_minimum:score.min,observed_value:user.credit_score,message:'The source describes this as preferred, not a hard cutoff.'});\n      if(!pass)unresolved=true;\n    }else{unresolved=true;reasons.push({criterion:'credit_score',status:'unknown',message:'The official source does not establish a score cutoff.'});}\n    results.push({user_id:user.user_id,product_id:product.product_id,snapshot_id:product.snapshot_id,decision:unresolved?'review':'eligible',reasons,rule_version:'rules-v2-staged'});\n  }\n}\nif(results.length>400)throw new Error('Page exceeds bounded decision limit');\nreturn [{json:{run_id:row.run_id,cursor_user_id:row.cursor_user_id,results,last_user_id:row.last_user_id,has_more:row.has_more}}];\n"
+      },
+      "id": "2eef828d-7f13-42a7-bfa7-9c2c47962dfd",
+      "name": "Evaluate confirmed rules · Code",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/internal/v1/save-match-batch",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        }
+      },
+      "id": "26313f50-7250-4d70-960a-4e28a50db9a1",
+      "name": "Persist explained decisions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1010,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickpe-internal",
+          "name": "ClickPe internal API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Receive queued run": {
+      "main": [
+        [
+          {
+            "node": "Fetch up to 200 profiles · Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch up to 200 profiles · Postgres": {
+      "main": [
+        [
+          {
+            "node": "Evaluate confirmed rules · Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate confirmed rules · Code": {
+      "main": [
+        [
+          {
+            "node": "Persist explained decisions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveExecutionProgress": false
+  },
+  "versionId": "de86b571-ccbb-4f7c-9716-6f0262111d45",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "id": "V5h9WodM8kKRAAhr"
+}
