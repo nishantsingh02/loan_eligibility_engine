@@ -1,0 +1,15 @@
+.git
+.gitignore
+.aws-build
+.serverless
+.env
+.env.*
+!.env.example
+.venv
+node_modules
+web
+tests
+data
+uploads
+__pycache__
+*.pyc

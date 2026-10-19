@@ -1,0 +1,1 @@
+"""ClickPe loan eligibility prototype."""

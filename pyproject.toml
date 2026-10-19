@@ -1,0 +1,37 @@
+[project]
+name = "clickpe-loan-eligibility-engine"
+version = "1.0.0"
+description = "Explainable loan-product discovery and eligibility screening prototype"
+requires-python = ">=3.12"
+dependencies = [
+  "boto3>=1.40,<2",
+  "fastapi>=0.116,<1",
+  "mangum>=0.19,<1",
+  "psycopg[binary,pool]>=3.2,<4",
+  "pydantic-settings>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+]
+
+[project.optional-dependencies]
+server = ["httpx>=0.28,<1", "uvicorn[standard]>=0.35,<1"]
+dev = ["pytest>=9.0.3,<10", "pytest-cov>=6.2,<7", "ruff>=0.12,<1", "mypy>=1.17,<2", "httpx>=0.28,<1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"app/api/routes.py" = ["B008"]
+
+[tool.ruff.format]
+quote-style = "double"
+
