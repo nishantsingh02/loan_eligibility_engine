@@ -1,0 +1,626 @@
+service: clickpe-loan-engine
+frameworkVersion: '3'
+useDotenv: true
+
+plugins:
+  - serverless-iam-roles-per-function
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: x86_64
+  region: ap-south-1
+  stage: ${opt:stage, 'demo'}
+  memorySize: 512
+  timeout: 28
+  versionFunctions: false
+  logRetentionInDays: 7
+  httpApi:
+    cors:
+      allowedOrigins:
+        - http://localhost:5173
+        - http://127.0.0.1:5173
+        - http://localhost:3000
+        - ${env:WEB_ORIGIN, 'http://localhost:3000'}
+      allowedHeaders: [Content-Type, X-Operator-Token, X-Internal-Token]
+      allowedMethods: [GET, POST, OPTIONS]
+      maxAge: 600
+  logs:
+    httpApi: true
+  vpc:
+    securityGroupIds:
+      - Ref: LambdaSecurityGroup
+    subnetIds:
+      - Ref: PrivateSubnetA
+      - Ref: PrivateSubnetB
+  environment:
+    APP_ENV: production
+    DATABASE_URL: postgresql://unused:unused@localhost:5432/loan_engine
+    DATABASE_SECRET_ARN:
+      Ref: DatabaseSecret
+    DATABASE_HOST:
+      Fn::GetAtt: [LoanDatabase, Endpoint.Address]
+    OPERATOR_TOKEN_SECRET_ARN:
+      Ref: OperatorTokenSecret
+    INTERNAL_TOKEN_SECRET_ARN:
+      Ref: InternalTokenSecret
+    LOCAL_UPLOAD_DIR: /tmp/clickpe-uploads
+    MAX_UPLOAD_BYTES: '26214400'
+    RETENTION_DAYS: '7'
+    S3_UPLOAD_BUCKET:
+      Ref: ApplicantUploadBucket
+    WEB_ORIGIN: ${env:WEB_ORIGIN, 'http://localhost:3000'}
+    NOTIFICATION_MODE: ${env:NOTIFICATION_MODE, 'preview'}
+
+package:
+  artifact: .aws-build/loan-engine.zip
+  patterns:
+    - app/**
+    - web/dist/**
+    - migrations/*.sql
+    - '!tests/**'
+    - '!web/src/**'
+    - '!web/node_modules/**'
+    - '!n8n/**'
+    - '!users.csv'
+    - '!*.docx'
+    - '!Screenshot*.png'
+
+custom:
+  uploadBucketName: clickpe-loan-${aws:accountId}-${aws:region}-${sls:stage}
+  defaultHostImage: {Ref: LatestAmazonLinux}
+
+functions:
+  api:
+    handler: app.lambda_handlers.api
+    timeout: 28
+    memorySize: 512
+    events:
+      - httpApi:
+          path: /{proxy+}
+          method: ANY
+      - httpApi:
+          path: /
+          method: GET
+    iamRoleStatementsName: clickpe-api-${sls:stage}
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [secretsmanager:GetSecretValue]
+        Resource:
+          - Ref: DatabaseSecret
+          - Ref: OperatorTokenSecret
+          - Ref: InternalTokenSecret
+      - Effect: Allow
+        Action: [s3:PutObject]
+        Resource:
+          Fn::Sub: '${ApplicantUploadBucket.Arn}/incoming/*'
+      - Effect: Allow
+        Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface, ec2:AssignPrivateIpAddresses, ec2:UnassignPrivateIpAddresses]
+        Resource: '*'
+
+  ingest:
+    handler: app.lambda_handlers.ingest_queue
+    timeout: 300
+    memorySize: 512
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt: [UploadQueue, Arn]
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
+    iamRoleStatementsName: clickpe-ingest-${sls:stage}
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [secretsmanager:GetSecretValue]
+        Resource:
+          - Ref: DatabaseSecret
+      - Effect: Allow
+        Action: [s3:GetObject, s3:DeleteObject]
+        Resource:
+          Fn::Sub: '${ApplicantUploadBucket.Arn}/incoming/*'
+      - Effect: Allow
+        Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface, ec2:AssignPrivateIpAddresses, ec2:UnassignPrivateIpAddresses]
+        Resource: '*'
+
+  migrate:
+    handler: app.lambda_handlers.migrate_lambda
+    timeout: 300
+    memorySize: 512
+    iamRoleStatementsName: clickpe-migrate-${sls:stage}
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [secretsmanager:GetSecretValue]
+        Resource:
+          - Ref: DatabaseSecret
+      - Effect: Allow
+        Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface, ec2:AssignPrivateIpAddresses, ec2:UnassignPrivateIpAddresses]
+        Resource: '*'
+
+  retention:
+    handler: app.lambda_handlers.purge_retained_data
+    timeout: 120
+    memorySize: 256
+    events:
+      - schedule: rate(1 day)
+    iamRoleStatementsName: clickpe-retention-${sls:stage}
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [secretsmanager:GetSecretValue]
+        Resource:
+          - Ref: DatabaseSecret
+      - Effect: Allow
+        Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface, ec2:AssignPrivateIpAddresses, ec2:UnassignPrivateIpAddresses]
+        Resource: '*'
+
+resources:
+  Description: ClickPe eligibility demo with private PostgreSQL, bounded CSV ingestion and self-hosted n8n workflows.
+  Metadata:
+    AWSToolsMetrics:
+      AWSAgentToolkit: aws-cloudformation@3
+  Parameters:
+    LatestAmazonLinux:
+      Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+      Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  Resources:
+    AppVpc:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.42.0.0/16
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+        Tags: [{Key: Name, Value: 'clickpe-${sls:stage}'}]
+
+    InternetGateway:
+      Type: AWS::EC2::InternetGateway
+      Properties:
+        Tags: [{Key: Name, Value: 'clickpe-${sls:stage}-igw'}]
+    VpcGatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId: {Ref: AppVpc}
+        InternetGatewayId: {Ref: InternetGateway}
+
+    PublicSubnetA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: {Ref: AppVpc}
+        AvailabilityZone: {Fn::Select: [0, {Fn::GetAZs: ''}]}
+        CidrBlock: 10.42.1.0/24
+        MapPublicIpOnLaunch: true
+        Tags: [{Key: Name, Value: 'clickpe-${sls:stage}-public-a'}]
+    PublicSubnetB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: {Ref: AppVpc}
+        AvailabilityZone: {Fn::Select: [1, {Fn::GetAZs: ''}]}
+        CidrBlock: 10.42.2.0/24
+        MapPublicIpOnLaunch: true
+        Tags: [{Key: Name, Value: 'clickpe-${sls:stage}-public-b'}]
+    PrivateSubnetA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: {Ref: AppVpc}
+        AvailabilityZone: {Fn::Select: [0, {Fn::GetAZs: ''}]}
+        CidrBlock: 10.42.11.0/24
+        MapPublicIpOnLaunch: false
+        Tags: [{Key: Name, Value: 'clickpe-${sls:stage}-private-a'}]
+    PrivateSubnetB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: {Ref: AppVpc}
+        AvailabilityZone: {Fn::Select: [1, {Fn::GetAZs: ''}]}
+        CidrBlock: 10.42.12.0/24
+        MapPublicIpOnLaunch: false
+        Tags: [{Key: Name, Value: 'clickpe-${sls:stage}-private-b'}]
+
+    PublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: {Ref: AppVpc}
+    PublicDefaultRoute:
+      Type: AWS::EC2::Route
+      DependsOn: VpcGatewayAttachment
+      Properties:
+        RouteTableId: {Ref: PublicRouteTable}
+        DestinationCidrBlock: 0.0.0.0/0
+        GatewayId: {Ref: InternetGateway}
+    PublicSubnetARoute:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties: {SubnetId: {Ref: PublicSubnetA}, RouteTableId: {Ref: PublicRouteTable}}
+    PublicSubnetBRoute:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties: {SubnetId: {Ref: PublicSubnetB}, RouteTableId: {Ref: PublicRouteTable}}
+    PrivateRouteTableA:
+      Type: AWS::EC2::RouteTable
+      Properties: {VpcId: {Ref: AppVpc}}
+    PrivateRouteTableB:
+      Type: AWS::EC2::RouteTable
+      Properties: {VpcId: {Ref: AppVpc}}
+    PrivateSubnetARoute:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties: {SubnetId: {Ref: PrivateSubnetA}, RouteTableId: {Ref: PrivateRouteTableA}}
+    PrivateSubnetBRoute:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties: {SubnetId: {Ref: PrivateSubnetB}, RouteTableId: {Ref: PrivateRouteTableB}}
+
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Lambda access to private RDS and Secrets Manager
+        VpcId: {Ref: AppVpc}
+        SecurityGroupEgress: [{IpProtocol: '-1', CidrIp: 0.0.0.0/0}]
+    HostSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: n8n operator access uses Systems Manager port forwarding only
+        VpcId: {Ref: AppVpc}
+        SecurityGroupEgress: [{IpProtocol: '-1', CidrIp: 0.0.0.0/0}]
+    RdsSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: PostgreSQL is reachable only from the API and n8n host
+        VpcId: {Ref: AppVpc}
+        SecurityGroupIngress:
+          - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: {Ref: LambdaSecurityGroup}}
+          - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: {Ref: HostSecurityGroup}}
+    SecretsEndpointSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: HTTPS access to Secrets Manager from app runtimes
+        VpcId: {Ref: AppVpc}
+        SecurityGroupIngress:
+          - {IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: {Ref: LambdaSecurityGroup}}
+          - {IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: {Ref: HostSecurityGroup}}
+        SecurityGroupEgress: [{IpProtocol: '-1', CidrIp: 0.0.0.0/0}]
+
+    S3GatewayEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcId: {Ref: AppVpc}
+        VpcEndpointType: Gateway
+        ServiceName: {Fn::Sub: 'com.amazonaws.${AWS::Region}.s3'}
+        RouteTableIds: [{Ref: PublicRouteTable}, {Ref: PrivateRouteTableA}, {Ref: PrivateRouteTableB}]
+    SecretsManagerEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcId: {Ref: AppVpc}
+        VpcEndpointType: Interface
+        PrivateDnsEnabled: true
+        ServiceName: {Fn::Sub: 'com.amazonaws.${AWS::Region}.secretsmanager'}
+        SubnetIds: [{Ref: PrivateSubnetA}, {Ref: PrivateSubnetB}]
+        SecurityGroupIds: [{Ref: SecretsEndpointSecurityGroup}]
+
+    DatabaseSecret:
+      Type: AWS::SecretsManager::Secret
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        Name: {Fn::Sub: '/clickpe/${sls:stage}/database'}
+        Description: PostgreSQL credentials for the ClickPe prototype
+        GenerateSecretString:
+          SecretStringTemplate: '{"username":"loan_engine","dbname":"loan_engine"}'
+          GenerateStringKey: password
+          PasswordLength: 40
+          ExcludePunctuation: true
+    OperatorTokenSecret:
+      Type: AWS::SecretsManager::Secret
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        Name: {Fn::Sub: '/clickpe/${sls:stage}/operator-token'}
+        GenerateSecretString: {PasswordLength: 56, ExcludePunctuation: true}
+    InternalTokenSecret:
+      Type: AWS::SecretsManager::Secret
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        Name: {Fn::Sub: '/clickpe/${sls:stage}/internal-token'}
+        GenerateSecretString: {PasswordLength: 56, ExcludePunctuation: true}
+    N8nEncryptionSecret:
+      Type: AWS::SecretsManager::Secret
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        Name: {Fn::Sub: '/clickpe/${sls:stage}/n8n-encryption-key'}
+        GenerateSecretString: {PasswordLength: 64, ExcludePunctuation: true}
+    RunnerSecret:
+      Type: AWS::SecretsManager::Secret
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        Name: {Fn::Sub: '/clickpe/${sls:stage}/n8n-runner-token'}
+        GenerateSecretString: {PasswordLength: 56, ExcludePunctuation: true}
+    SesExternalIdSecret:
+      Type: AWS::SecretsManager::Secret
+      Metadata:
+        com.aws.cloudformation.Context:
+          why: Separate external ID for the n8n SES role assumption.
+          must: Keep the generated value out of workflow exports and application bundles.
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        Name: {Fn::Sub: '/clickpe/${sls:stage}/ses-external-id'}
+        GenerateSecretString: {PasswordLength: 56, ExcludePunctuation: true}
+
+    DatabaseSubnetGroup:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: Private two-zone subnets for the prototype database
+        SubnetIds: [{Ref: PrivateSubnetA}, {Ref: PrivateSubnetB}]
+        DBSubnetGroupName: {Fn::Sub: '${AWS::StackName}-db-subnets'}
+    LoanDatabase:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        DBInstanceIdentifier: {Fn::Sub: '${AWS::StackName}-db'}
+        Engine: postgres
+        EngineVersion: '16.15'
+        DBInstanceClass: db.t4g.small
+        AllocatedStorage: '20'
+        StorageType: gp3
+        StorageEncrypted: true
+        DBName: loan_engine
+        MasterUsername: {Fn::Sub: '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}'}
+        MasterUserPassword: {Fn::Sub: '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'}
+        DBSubnetGroupName: {Ref: DatabaseSubnetGroup}
+        VPCSecurityGroups: [{Ref: RdsSecurityGroup}]
+        PubliclyAccessible: false
+        MultiAZ: false
+        BackupRetentionPeriod: 1
+        DeleteAutomatedBackups: true
+        DeletionProtection: false
+        AutoMinorVersionUpgrade: false
+        EnablePerformanceInsights: false
+        CopyTagsToSnapshot: false
+        Tags: [{Key: Project, Value: ClickPeLoanEngine}, {Key: Stage, Value: '${sls:stage}'}]
+
+    UploadDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: {Fn::Sub: '${AWS::StackName}-upload-dlq'}
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+    UploadQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: {Fn::Sub: '${AWS::StackName}-uploads'}
+        VisibilityTimeout: 1800
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+        RedrivePolicy:
+          deadLetterTargetArn: {Fn::GetAtt: [UploadDeadLetterQueue, Arn]}
+          maxReceiveCount: 5
+    UploadQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [{Ref: UploadQueue}]
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: {Service: s3.amazonaws.com}
+              Action: sqs:SendMessage
+              Resource: {Fn::GetAtt: [UploadQueue, Arn]}
+              Condition:
+                ArnLike:
+                  aws:SourceArn:
+                    Fn::Sub: 'arn:${AWS::Partition}:s3:::clickpe-loan-${AWS::AccountId}-${AWS::Region}-${sls:stage}'
+                StringEquals:
+                  aws:SourceAccount: {Ref: AWS::AccountId}
+
+    ApplicantUploadBucket:
+      Type: AWS::S3::Bucket
+      DependsOn: UploadQueuePolicy
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        BucketName: ${self:custom.uploadBucketName}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          IgnorePublicAcls: true
+          BlockPublicPolicy: true
+          RestrictPublicBuckets: true
+        OwnershipControls:
+          Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - "${env:WEB_ORIGIN, 'http://localhost:3000'}"
+              AllowedMethods: [POST]
+              AllowedHeaders: ['*']
+              ExposedHeaders: [ETag]
+              MaxAge: 300
+        LifecycleConfiguration:
+          Rules:
+            - Id: DeleteAbandonedUploads
+              Prefix: incoming/
+              Status: Enabled
+              ExpirationInDays: 1
+              AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+            - Id: ExpireBootstrapArchive
+              Prefix: deployment/
+              Status: Enabled
+              ExpirationInDays: 30
+        NotificationConfiguration:
+          QueueConfigurations:
+            - Event: s3:ObjectCreated:*
+              Queue: {Fn::GetAtt: [UploadQueue, Arn]}
+              Filter:
+                S3Key:
+                  Rules: [{Name: prefix, Value: incoming/}]
+
+    N8nHostRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: {Fn::Sub: 'clickpe-n8n-${sls:stage}'}
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}]
+        ManagedPolicyArns: [{Fn::Sub: 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'}]
+        Policies:
+          - PolicyName: ReadPrototypeSecretsAndBundle
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: [secretsmanager:GetSecretValue]
+                  Resource: [{Ref: DatabaseSecret}, {Ref: InternalTokenSecret}, {Ref: N8nEncryptionSecret}, {Ref: RunnerSecret}, {Ref: SesExternalIdSecret}]
+                - Effect: Allow
+                  Action: [s3:GetObject]
+                  Resource: {Fn::Sub: '${ApplicantUploadBucket.Arn}/deployment/source.zip'}
+    SesSenderRole:
+      Type: AWS::IAM::Role
+      Metadata:
+        com.aws.cloudformation.Context:
+          why: Renewable SES credentials for the n8n host without IAM user access keys.
+          must: Restrict the sender and every recipient to the configured controlled identities.
+      Properties:
+        RoleName: {Fn::Sub: 'clickpe-ses-${sls:stage}'}
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: {AWS: {Fn::GetAtt: [N8nHostRole, Arn]}}
+              Action: sts:AssumeRole
+              Condition:
+                StringEquals:
+                  sts:ExternalId: {Fn::Sub: '{{resolve:secretsmanager:${SesExternalIdSecret}:SecretString}}'}
+        Policies:
+          - PolicyName: SendOnlyControlledDemoEmail
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: ses:SendEmail
+                  Resource: {Fn::Sub: 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${env:SES_SENDER, "unconfigured@example.invalid"}'}
+                  Condition:
+                    StringEquals:
+                      ses:FromAddress: ${env:SES_SENDER, 'unconfigured@example.invalid'}
+                    ForAllValues:StringEquals:
+                      ses:Recipients: {Fn::Split: [',', '${env:TEST_RECIPIENTS, "unconfigured@example.invalid"}']}
+    SesAssumePolicy:
+      Type: AWS::IAM::Policy
+      Metadata:
+        com.aws.cloudformation.Context:
+          why: Separate policy avoids a dependency cycle between the host and SES roles.
+          must: Permit assumption of only the controlled SES sender role.
+      Properties:
+        PolicyName: AssumeControlledSesRole
+        Roles: [{Ref: N8nHostRole}]
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: sts:AssumeRole
+              Resource: {Fn::GetAtt: [SesSenderRole, Arn]}
+    N8nHostProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+        InstanceProfileName: {Fn::Sub: 'clickpe-n8n-${sls:stage}'}
+        Roles: [{Ref: N8nHostRole}]
+    N8nHost:
+      Type: AWS::EC2::Instance
+      Metadata:
+        com.aws.cloudformation.Context:
+          why: Private operator access to the self-hosted n8n orchestration runtime.
+          must: Require IMDSv2 and allow a hop limit of two for Docker role credentials.
+      Properties:
+        ImageId: ${env:N8N_AMI_ID, self:custom.defaultHostImage}
+        InstanceType: t4g.small
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        SubnetId: {Ref: PublicSubnetA}
+        SecurityGroupIds: [{Ref: HostSecurityGroup}]
+        IamInstanceProfile: {Ref: N8nHostProfile}
+        PropagateTagsToVolumeOnCreation: true
+        Tags: [{Key: Name, Value: {Fn::Sub: '${AWS::StackName}-n8n'}}, {Key: Project, Value: ClickPeLoanEngine}]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 16
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              set -euo pipefail
+              dnf install -y docker unzip jq
+              install -d -m 0755 /usr/local/lib/docker/cli-plugins /opt/clickpe
+              curl --fail --location --retry 5 --retry-delay 2 https://github.com/docker/buildx/releases/download/v0.17.1/buildx-v0.17.1.linux-arm64 --output /usr/local/lib/docker/cli-plugins/docker-buildx
+              chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+              curl --fail --location --retry 5 --retry-delay 2 https://github.com/docker/compose/releases/download/v2.40.1/docker-compose-linux-aarch64 --output /usr/local/lib/docker/cli-plugins/docker-compose
+              chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+              systemctl enable --now docker
+              systemctl enable --now amazon-ssm-agent
+              for attempt in $(seq 1 120); do
+                if aws s3 cp 's3://${ApplicantUploadBucket}/deployment/source.zip' /tmp/clickpe-source.zip --region ${AWS::Region}; then break; fi
+                sleep 30
+              done
+              test -s /tmp/clickpe-source.zip
+              unzip -q -o /tmp/clickpe-source.zip -d /opt/clickpe
+              DB_SECRET=$(aws secretsmanager get-secret-value --secret-id '${DatabaseSecret}' --query SecretString --output text --region ${AWS::Region})
+              INTERNAL_TOKEN=$(aws secretsmanager get-secret-value --secret-id '${InternalTokenSecret}' --query SecretString --output text --region ${AWS::Region})
+              N8N_KEY=$(aws secretsmanager get-secret-value --secret-id '${N8nEncryptionSecret}' --query SecretString --output text --region ${AWS::Region})
+              RUNNER_TOKEN=$(aws secretsmanager get-secret-value --secret-id '${RunnerSecret}' --query SecretString --output text --region ${AWS::Region})
+              DB_PASSWORD=$(printf '%s' "$DB_SECRET" | jq -r .password)
+              chmod 700 /opt/clickpe
+              umask 077
+              cat > /opt/clickpe/.env <<EOF
+              APP_ENV=production
+              AWS_REGION=${AWS::Region}
+              DATABASE_URL=postgresql://unused:unused@localhost:5432/loan_engine
+              DATABASE_SECRET_ARN=${DatabaseSecret}
+              DATABASE_HOST=${LoanDatabase.Endpoint.Address}
+              DATABASE_NAME=loan_engine
+              OPERATOR_TOKEN_SECRET_ARN=${OperatorTokenSecret}
+              INTERNAL_TOKEN_SECRET_ARN=${InternalTokenSecret}
+              INTERNAL_API_TOKEN=$INTERNAL_TOKEN
+              POSTGRES_PASSWORD=$DB_PASSWORD
+              LOCAL_UPLOAD_DIR=/data/uploads
+              MAX_UPLOAD_BYTES=26214400
+              RETENTION_DAYS=7
+              OPERATOR_TOKEN=unused
+              N8N_WEBHOOK_URL=http://n8n:5678/webhook/match-run
+              WEBHOOK_URL=http://localhost:5678/
+              N8N_ENCRYPTION_KEY=$N8N_KEY
+              N8N_RUNNERS_AUTH_TOKEN=$RUNNER_TOKEN
+              N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+              GENERIC_TIMEZONE=Asia/Kolkata
+              DB_HOST=${LoanDatabase.Endpoint.Address}
+              S3_UPLOAD_BUCKET=${ApplicantUploadBucket}
+              WEB_ORIGIN=http://localhost:3000
+              VITE_API_BASE_URL=https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+              TEST_RECIPIENTS=
+              NOTIFICATION_MODE=preview
+              EOF
+              chmod 600 /opt/clickpe/.env
+              cd /opt/clickpe
+              COMPOSE_PARALLEL_LIMIT=1 docker compose up -d --build
+
+  Outputs:
+    ApiBaseUrl:
+      Description: HTTP API endpoint used by the browser console
+      Value: {Fn::Sub: 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'}
+    UploadBucketName:
+      Value: {Ref: ApplicantUploadBucket}
+    DatabaseHost:
+      Value: {Fn::GetAtt: [LoanDatabase, Endpoint.Address]}
+    N8nInstanceId:
+      Value: {Ref: N8nHost}
+    DatabaseSecretArn:
+      Value: {Ref: DatabaseSecret}
+    OperatorTokenSecretArn:
+      Value: {Ref: OperatorTokenSecret}
+    InternalTokenSecretArn:
+      Value: {Ref: InternalTokenSecret}
+    SesRoleArn:
+      Value: {Fn::GetAtt: [SesSenderRole, Arn]}
+    SesExternalIdSecretArn:
+      Value: {Ref: SesExternalIdSecret}
