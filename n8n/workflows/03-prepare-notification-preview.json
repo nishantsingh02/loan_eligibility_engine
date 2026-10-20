@@ -1,0 +1,563 @@
+{
+  "name": "03 Notify matched applicants",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "notification-preview",
+        "authentication": "headerAuth",
+        "responseMode": "lastNode",
+        "options": {
+          "allowedOrigins": ""
+        }
+      },
+      "id": "a1167d84-378b-4a8f-8d6b-13c10a8ba688",
+      "name": "Receive completed run",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        260
+      ],
+      "webhookId": "4ba0a872-6c40-4290-a911-9fa2b64281df",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickpe-internal",
+          "name": "ClickPe internal API"
+        }
+      }
+    },
+    {
+      "name": "Resume pending deliveries",
+      "id": "3975bc13-3e47-519f-88d3-42be6036e36e",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "position": [
+        240,
+        500
+      ]
+    },
+    {
+      "name": "Prepare applicant notifications",
+      "id": "37431362-57ef-5e2b-8676-d13b239a464e",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'http://api:8000/internal/v1/prepare-notifications/' + $json.body.run_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "position": [
+        460,
+        260
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickpe-internal",
+          "name": "ClickPe internal API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "name": "Claim up to five applicants",
+      "id": "8e564d48-740b-541c-af70-5f57c39b0463",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/internal/v1/notification-claims",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"limit\":5}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "position": [
+        680,
+        360
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickpe-internal",
+          "name": "ClickPe internal API"
+        }
+      },
+      "retryOnFail": false
+    },
+    {
+      "name": "One item per applicant",
+      "id": "af2b4b80-5607-5961-85f3-6e70c30a54d1",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "parameters": {
+        "fieldToSplitOut": "deliveries",
+        "options": {}
+      },
+      "position": [
+        900,
+        360
+      ]
+    },
+    {
+      "name": "Deliver applicants sequentially",
+      "id": "d444fdb9-1e8b-5e72-8004-24e0b6d28094",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "position": [
+        1120,
+        360
+      ]
+    },
+    {
+      "name": "Compose personalized email",
+      "id": "60fac72a-fb04-531d-99a0-be51134bd5ce",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d=$json;\nconst lines=d.products.map(p=>'- '+p.lender+': '+p.product_name+'\\n  '+p.source_url).join('\\n');\nreturn {json:{...d,subject:'Your matched loan products',body:'Hello '+d.name+',\\n\\nYour profile meets the confirmed rules for:\\n'+lines+'\\n\\nThis is an eligibility screening demonstration, not loan approval. The lender makes the final decision.\\n\\nApplicant reference: '+d.user_id}};"
+      },
+      "position": [
+        1340,
+        420
+      ]
+    },
+    {
+      "name": "Pace SES requests",
+      "id": "423facf7-4ea9-5357-be24-3db855acc947",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": 2,
+        "unit": "seconds"
+      },
+      "position": [
+        1560,
+        420
+      ],
+      "webhookId": "3b670efc-29ca-4d69-9970-6a862b473bc5"
+    },
+    {
+      "name": "Reserve delivery before SES",
+      "id": "c92a5737-ef51-5093-852a-5f93e41ec4da",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'http://api:8000/internal/v1/notification-deliveries/' + $json.delivery_id + '/begin' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({claim_token:$json.claim_token}) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "position": [
+        1780,
+        420
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickpe-internal",
+          "name": "ClickPe internal API"
+        }
+      },
+      "retryOnFail": false
+    },
+    {
+      "name": "Controlled test delivery enabled?",
+      "id": "dd2913dc-4845-51fc-906f-fa13ed2e534d",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.delivery_enabled }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "position": [
+        2000,
+        420
+      ]
+    },
+    {
+      "name": "Attach personalized message",
+      "id": "67b0c164-f8d8-5914-b2c0-6a02283e97b8",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "return {json:{...$('Compose personalized email').item.json,...$json}};"
+      },
+      "position": [
+        2220,
+        320
+      ]
+    },
+    {
+      "name": "Send applicant email",
+      "id": "5b0f1218-c7c3-4785-af4e-2da7e02617a0",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "parameters": {
+        "resource": "email",
+        "operation": "send",
+        "fromEmail": "={{ $json.sender }}",
+        "toAddresses": [
+          "={{ $json.recipient }}"
+        ],
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.body }}",
+        "isBodyHtml": false,
+        "additionalFields": {},
+        "authentication": "assumeRole"
+      },
+      "position": [
+        2440,
+        320
+      ],
+      "retryOnFail": false,
+      "credentials": {
+        "awsAssumeRole": {
+          "id": "clickpe-ses",
+          "name": "ClickPe SES test sender"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "name": "Record SES receipt",
+      "id": "e1efbdf5-bd32-5c3b-8a8c-e990d37d77ca",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/internal/v1/notification-receipt",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({delivery_id:$('Attach personalized message').item.json.delivery_id,claim_token:$('Attach personalized message').item.json.claim_token,message_id:($json.MessageId || $json.SendEmailResult?.MessageId || $json.SendEmailResponse?.SendEmailResult?.MessageId)}) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "position": [
+        2680,
+        260
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickpe-internal",
+          "name": "ClickPe internal API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "name": "Classify send failure",
+      "id": "d5786a69-f927-53a4-92e1-9af52935201b",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d=$('Attach personalized message').item.json;\nconst e=JSON.stringify($json.error||$json);\n// Stock SES node drops AWS XML error codes. HTTP400 is a known rejection,\n// but cannot safely distinguish SES throttling from validation failures.\nconst throttled=/Throttling|TooManyRequestsException|The service is receiving too many requests from you/.test(e);\nconst rejected=throttled||/MessageRejected|MailFromDomainNotVerified|InvalidParameterValue|AccessDenied|Bad request - please check your parameters|Forbidden - perhaps check your credentials|Authorization failed/.test(e);\nreturn {json:{delivery_id:d.delivery_id,claim_token:d.claim_token,outcome:rejected?'rejected':'uncertain',error_code:throttled?'throttled':(rejected?'rejected':'transport_error')}};"
+      },
+      "position": [
+        2680,
+        500
+      ]
+    },
+    {
+      "name": "Record send outcome",
+      "id": "fee74327-b651-56ae-a6ff-67082cd19e6f",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'http://api:8000/internal/v1/notification-deliveries/' + $json.delivery_id + '/failure' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({claim_token:$json.claim_token,outcome:$json.outcome,error_code:$json.error_code}) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "position": [
+        2900,
+        500
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickpe-internal",
+          "name": "ClickPe internal API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "name": "Delivery batch finished",
+      "id": "791fce5c-190e-5c3e-a777-6711f001b647",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        1340,
+        140
+      ]
+    }
+  ],
+  "connections": {
+    "Receive completed run": {
+      "main": [
+        [
+          {
+            "node": "Prepare applicant notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare applicant notifications": {
+      "main": [
+        [
+          {
+            "node": "Claim up to five applicants",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resume pending deliveries": {
+      "main": [
+        [
+          {
+            "node": "Claim up to five applicants",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim up to five applicants": {
+      "main": [
+        [
+          {
+            "node": "One item per applicant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One item per applicant": {
+      "main": [
+        [
+          {
+            "node": "Deliver applicants sequentially",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deliver applicants sequentially": {
+      "main": [
+        [
+          {
+            "node": "Delivery batch finished",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose personalized email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose personalized email": {
+      "main": [
+        [
+          {
+            "node": "Pace SES requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pace SES requests": {
+      "main": [
+        [
+          {
+            "node": "Reserve delivery before SES",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reserve delivery before SES": {
+      "main": [
+        [
+          {
+            "node": "Controlled test delivery enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Controlled test delivery enabled?": {
+      "main": [
+        [
+          {
+            "node": "Attach personalized message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Deliver applicants sequentially",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach personalized message": {
+      "main": [
+        [
+          {
+            "node": "Send applicant email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send applicant email": {
+      "main": [
+        [
+          {
+            "node": "Record SES receipt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classify send failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify send failure": {
+      "main": [
+        [
+          {
+            "node": "Record send outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record SES receipt": {
+      "main": [
+        [
+          {
+            "node": "Deliver applicants sequentially",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record send outcome": {
+      "main": [
+        [
+          {
+            "node": "Deliver applicants sequentially",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveExecutionProgress": false,
+    "timezone": "Asia/Kolkata"
+  },
+  "versionId": "c6bd951e-afe2-44a2-aab4-e4f61cff6ce9",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "id": "iIPgqTowQSmk7b67"
+}
