@@ -1,0 +1,9 @@
+.upload-feedback {
+  margin: 12px 0 0;
+}
+
+.upload-feedback.info {
+  background: #f2f6fd;
+  border: 1px solid #e0e8f4;
+  color: #48627f;
+}

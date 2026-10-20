@@ -1,0 +1,17 @@
+.pagination { display: flex; gap: 8px; }
+.results-loading { padding: 0 24px; color: #536782; font-size: 13px; }
+.decision-dialog { border: 1px solid #dbe4f0; border-radius: 18px; width: min(660px, calc(100vw - 32px)); max-height: 85vh; padding: 28px; color: #19304d; box-shadow: 0 24px 80px #10243f35; }
+.decision-dialog::backdrop { background: #10243f80; }
+.dialog-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.dialog-heading h2 { margin: 8px 0; }
+.dialog-heading p, .evidence-list p { color: #536782; line-height: 1.6; }
+.snapshot-details { display: grid; gap: 12px; padding: 16px; background: #f4f7fc; border-radius: 10px; }
+.snapshot-details dt { font-size: 12px; color: #536782; }
+.snapshot-details dd { margin: 4px 0 0; overflow-wrap: anywhere; font-size: 13px; }
+.evidence-list { margin-top: 20px; }
+.evidence-list article { padding: 12px 0; border-top: 1px solid #e3eaf3; }
+.evidence-list strong { display: flex; justify-content: space-between; align-items: center; text-transform: capitalize; gap: 12px; }
+.evidence-list p { margin-bottom: 0; font-size: 14px; }
+.error-banner .button { margin-left: auto; flex-shrink: 0; }
+button:focus-visible, a:focus-visible { outline: 3px solid #4d7cff; outline-offset: 3px; }
+@media (max-width: 600px) { .table-footer { gap: 12px; flex-wrap: wrap; } .decision-dialog { padding: 18px; } }
