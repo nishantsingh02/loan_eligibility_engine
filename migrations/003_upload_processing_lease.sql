@@ -1,0 +1,2 @@
+ALTER TABLE upload
+  ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMPTZ;
