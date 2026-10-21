@@ -1,0 +1,60 @@
+name: Build Lambda package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build the static console
+        run: |
+          npm ci --prefix web
+          npm run build --prefix web
+        env:
+          VITE_API_BASE_URL: ''
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+      - name: Export locked runtime dependencies
+        run: uv export --locked --no-dev --no-hashes --no-emit-project --format requirements.txt --output-file requirements.txt
+      - name: Build the Linux Lambda archive
+        shell: bash
+        run: |
+          package="$RUNNER_TEMP/clickpe-lambda"
+          mkdir -p "$package/app" "$package/migrations" "$package/web/dist" .aws-build
+          uv pip install --python 3.12 --target "$package" --only-binary :all: --requirements requirements.txt
+          cp -R app/. "$package/app/"
+          cp migrations/*.sql "$package/migrations/"
+          cp -R web/dist/. "$package/web/dist/"
+          find "$package" -type d -name __pycache__ -prune -exec rm -rf {} +
+          find "$package" -type f -name '*.pyc' -delete
+          (cd "$package" && zip -qr "$GITHUB_WORKSPACE/.aws-build/loan-engine.zip" .)
+          python - <<'PY'
+          from zipfile import ZipFile
+
+          with ZipFile(".aws-build/loan-engine.zip") as bundle:
+              names = bundle.namelist()
+              assert "app/lambda_handlers.py" in names
+              assert "migrations/003_upload_processing_lease.sql" in names
+              assert "web/dist/index.html" in names
+              assert not any(name.lower().endswith((".csv", ".docx", ".png")) for name in names)
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: clickpe-lambda
+          path: .aws-build/loan-engine.zip
+          if-no-files-found: error
+          retention-days: 3
